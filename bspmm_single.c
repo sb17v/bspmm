@@ -29,7 +29,7 @@
 #define COMPUTE 1
 #define FINE_TIME 1
 #define WARMUP 1
-#define CHECK_FOR_ERRORS 0
+#define CHECK_FOR_ERRORS 1
 #define SHOW_WORKLOAD_DIST 0
 
 #if COMPUTE
@@ -356,7 +356,7 @@ int main(int argc, char **argv)
                     tile_sum += local_c[tile_i*tile_dim + tile_j];
                 }
             }
-            printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %d\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c); 
+            printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
 #endif
             /* accumulate tile C (always use MPI since we need to ensure atomicity during accumulation) */
 #if FINE_TIME
@@ -462,7 +462,7 @@ int main(int argc, char **argv)
                 tile_sum += local_c[tile_i*tile_dim + tile_j];
             }
         }
-        printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %d\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c); 
+        printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
 #endif
 #if FINE_TIME
         accum_counter++;
@@ -656,7 +656,7 @@ int main(int argc, char **argv)
                     MPI_Get(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c, elements_in_tile, MPI_DOUBLE, win);
                     MPI_Win_flush(target_rank_c, win);
 #if DEBUG
-                    //printf("Rank %d got tile %d with value %.1f from rank %d using offset %d\n", rank, global_tile_c, local_c[0], target_rank_c, target_offset_c); 
+                    //printf("Rank %d got tile %d with value %.1f from rank %d using offset %ld\n", rank, global_tile_c, local_c[0], target_rank_c, target_offset_c);
 #endif
                     for (tile_i = 0; tile_i < tile_dim; tile_i++) {
                         for (tile_j = 0; tile_j < tile_dim; tile_j++) {

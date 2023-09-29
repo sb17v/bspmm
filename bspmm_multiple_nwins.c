@@ -436,7 +436,7 @@ int main(int argc, char **argv)
                         tile_sum += local_tc[tile_i*tile_dim + tile_j];
                     }
                 }
-                printf("Worker %d accumulating (0) tile %d with value %.1f on rank %d using offset %d\n", rank*num_threads + tid, prev_tile_c, tile_sum, target_rank_c, target_offset_c); 
+                printf("Worker %d accumulating (0) tile %d with value %.1f on rank %d using offset %ld\n", rank*num_threads + tid, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
                 fflush(stdout);
 #endif
                 /* accumulate tile C (always use MPI since we need to ensure atomicity during accumulation) */
@@ -455,7 +455,7 @@ int main(int argc, char **argv)
                 t_accum_flush += (MPI_Wtime() - t_start);
 #endif
 #if DEBUG
-                printf("Worker %d accumulated (0) tile %d on rank %d using offset %d\n", rank*num_threads + tid, prev_tile_c, target_rank_c, target_offset_c); 
+                printf("Worker %d accumulated (0) tile %d on rank %d using offset %ld\n", rank*num_threads + tid, prev_tile_c, target_rank_c, target_offset_c);
                 fflush(stdout);
 #endif
                 /* Reset the local C tile for local accumulation */
@@ -478,7 +478,7 @@ int main(int argc, char **argv)
             } else {
                 /* get tile A */
 #if DEBUG
-                printf("Worker %d trying to get A tile %d from rank %d using offset %d (old value %.1f)\n", rank*num_threads + tid, global_tile_a, target_rank_a, disp_a + target_offset_a, local_ta[0]);
+                printf("Worker %d trying to get A tile %d from rank %d using offset %ld (old value %.1f)\n", rank*num_threads + tid, global_tile_a, target_rank_a, disp_a + target_offset_a, local_ta[0]);
                 fflush(stdout);
 #endif
 #if FINE_TIME
@@ -498,7 +498,7 @@ int main(int argc, char **argv)
                 //    printf("WRONG: Worker %d got wrong value of tile A\n", rank*num_threads + tid);
             }
 #if DEBUG
-                printf("Worker %d got A tile %d with value %.1f from rank %d using offset %d\n", rank*num_threads + tid, global_tile_a, local_ta[0], target_rank_a, disp_a + target_offset_a);
+                printf("Worker %d got A tile %d with value %.1f from rank %d using offset %ld\n", rank*num_threads + tid, global_tile_a, local_ta[0], target_rank_a, disp_a + target_offset_a);
                 fflush(stdout);
 #endif
 
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
             } else {
                 /* get tile B */
 #if DEBUG
-                printf("Worker %d trying to get B tile %d from rank %d using offset %d (old value %.1f)\n", rank*num_threads + tid, global_tile_b, target_rank_b, disp_b + target_offset_b, local_tb[0]);
+                printf("Worker %d trying to get B tile %d from rank %d using offset %ld (old value %.1f)\n", rank*num_threads + tid, global_tile_b, target_rank_b, disp_b + target_offset_b, local_tb[0]);
                 fflush(stdout);
 #endif
 #if FINE_TIME
@@ -537,7 +537,7 @@ int main(int argc, char **argv)
                 //    printf("WRONG: Worker %d got wrong value of tile B\n", rank*num_threads + tid);
             }
 #if DEBUG
-                printf("Worker %d got B tile %d with value %.1f from rank %d using offset %d\n", rank*num_threads + tid, global_tile_b, local_tb[0], target_rank_b, disp_b + target_offset_b);
+                printf("Worker %d got B tile %d with value %.1f from rank %d using offset %ld\n", rank*num_threads + tid, global_tile_b, local_tb[0], target_rank_b, disp_b + target_offset_b);
                 fflush(stdout);
 #endif
 #if COMPUTE
@@ -564,7 +564,7 @@ int main(int argc, char **argv)
                     tile_sum += local_tc[tile_i*tile_dim + tile_j];
                 }
             }
-            printf("Worker %d accumulating (1) tile %d with value %.1f on rank %d using offset %d\n", rank*num_threads + tid, prev_tile_c, tile_sum, target_rank_c, target_offset_c); 
+            printf("Worker %d accumulating (1) tile %d with value %.1f on rank %d using offset %ld\n", rank*num_threads + tid, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
             fflush(stdout);
 #endif
 #if FINE_TIME
@@ -582,7 +582,7 @@ int main(int argc, char **argv)
             t_accum_flush += (MPI_Wtime() - t_start);
 #endif
 #if DEBUG
-        printf("Worker %d accumulated (1) tile %d on rank %d using offset %d\n", rank*num_threads + tid, prev_tile_c, target_rank_c, target_offset_c);
+        printf("Worker %d accumulated (1) tile %d on rank %d using offset %ld\n", rank*num_threads + tid, prev_tile_c, target_rank_c, target_offset_c);
         fflush(stdout);
 #endif
         }
@@ -783,7 +783,7 @@ int main(int argc, char **argv)
                     MPI_Get(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, target_offset_c, elements_in_tile, MPI_DOUBLE, win_c);
                     MPI_Win_flush(target_rank_c, win_c);
 #if DEBUG
-                    //printf("Rank %d got tile %d with value %.1f from rank %d using offset %d\n", rank, global_tile_c, local_c[0], target_rank_c, target_offset_c); 
+                    //printf("Rank %d got tile %d with value %.1f from rank %d using offset %ld\n", rank, global_tile_c, local_c[0], target_rank_c, target_offset_c);
 #endif
                     for (tile_i = 0; tile_i < tile_dim; tile_i++) {
                         for (tile_j = 0; tile_j < tile_dim; tile_j++) {
