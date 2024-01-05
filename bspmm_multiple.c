@@ -218,7 +218,7 @@ int main(int argc, char **argv)
         int i, k, j;
         int prev_tile_c;
         double *target_tile;
-        double *local_ta, *local_tb, *local_tc;
+        double *local_ta = NULL, *local_tb = NULL, *local_tc = NULL;
         const int one = 1;
         int global_tile_a, global_tile_b, global_tile_c;
         int target_rank_a, target_rank_b, target_rank_c;
@@ -364,7 +364,7 @@ int main(int argc, char **argv)
         int i, k, j;
         int prev_tile_c;
         double *target_tile;
-        double *local_ta, *local_tb, *local_tc;
+        double *local_ta = NULL, *local_tb = NULL, *local_tc = NULL;
         const int one = 1;
         int global_tile_a, global_tile_b, global_tile_c;
         int target_rank_a, target_rank_b, target_rank_c;

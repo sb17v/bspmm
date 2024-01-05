@@ -1,47 +1,10 @@
 #include "bspmm.h"
 #include <unistd.h>
+#include <assert.h>
 #if USE_CBLAS
     #include <cblas.h>
 #endif
 
-#define FINE_TIME 1
-
-#if FINE_TIME
-#define START_FINE_TIME(is_warmup) ({                       \
-        double t_start = 0.0;                               \
-        if (!is_warmup) {                                   \
-            t_start = MPI_Wtime();                          \
-        }                                                   \
-        t_start;                                            \
-})
-#else
-#define START_FINE_TIME(...) ({0.0;})
-#endif
-
-#if FINE_TIME
-#define GET_FINE_TIME(t_start, is_warmup) ({                \
-        double temp_timer = 0.0;                                  \
-        if (!is_warmup) {                                   \
-            temp_timer =  (MPI_Wtime() - t_start);          \
-        }                                                   \
-        temp_timer;                                         \
-})
-#else
-#define GET_FINE_TIME(...) ({0.0;})
-#endif
-
-#if FINE_TIME
-#define INCREMENT_COUNTER(counter, is_warmup) ({            \
-    int temp_counter;                                       \
-    if(!is_warmup) {                                        \
-        counter ++;                                         \
-        temp_counter =  counter;                            \
-    }                                                       \
-    temp_counter;                                           \
-})
-#else
-#define INCREMENT_COUNTER(...) ({0;})
-#endif
 /*
  * Block sparse matrix multiplication using RMA operations, a global counter for workload
  * distribution, MPI_THREAD_SINGLE mode.
@@ -64,16 +27,55 @@
  * each rank reads a counter to obtain its work id. The counter is updated
  * atomically each time it is read.
  */
+/* Enable any one of them */
+#define BSPMM_BLOCKING 0
+#define BSPMM_NON_BLOCKING 0
+#define BSPMM_PREFETCH_NON_BLOCKING 1
+
+#define USE_ACCUMULATE 0
+#define USE_RACCUMULATE 1
+
+/* Tuning Knob */
 #define OFI_WINDOW_HINTS 0
 #define COMPUTE 1
 #define ACCUMULATE 1
-#define WARMUP 0
-#define CHECK_FOR_ERRORS 1
+#define WARMUP 1
+#define CHECK_FOR_ERRORS 0
 #define SHOW_WORKLOAD_DIST 0
 #define DUMP_GET_TIMESTAMP 0
-
+#define ENABLE_LOGICAL_RANK 0
 #define LOCAL_C_COUNT 8
 
+/* Profiling */
+#define FINE_TIME 1
+
+#if FINE_TIME
+#define PROFILE_BSPMM_FUNC(func, is_warmup, t_op, op_counter, inc_counter)  \
+({                                                                          \
+    int ret;                                                                \
+    if (!is_warmup) {                                                       \
+        double t_start = 0.0;                                               \
+        t_start = MPI_Wtime();                                              \
+        ret = func;                                                         \
+        t_op += MPI_Wtime() - t_start;                                      \
+        if (inc_counter) {                                                  \
+            op_counter ++;                                                  \
+        }                                                                   \
+    } else {                                                                \
+        ret = func;                                                         \
+    }                                                                       \
+    ret;                                                                    \
+})
+#else
+#define PROFILE_BSPMM_FUNC(func, is_warmup, t_op, op_counter, inc_counter)  \
+({                                                                          \
+    int ret;                                                                \
+    ret = func;                                                             \
+    ret;                                                                    \
+})
+#endif
+
+/* Global vars */
 static int rank, nprocs;
 static int tile_dim, tile_num, p_dim, node_dim, ppn;
 MPI_Comm comm_world_counter;
@@ -90,7 +92,6 @@ MPI_Comm comm_world_counter;
 #endif
 
 static double t1 = 0.0, t2 = 0.0;
-static double t_start = 0.0;
 static double t_get = 0.0, t_local_get = 0.0, t_accum = 0.0, t_fetch_n_op = 0.0, t_comp = 0.0;
 static double t_get_flush = 0.0, t_accum_flush = 0.0, t_fetch_n_op_flush = 0.0, t_global_accum_flush = 0.0;
 static int get_counter = 0, local_get_counter = 0, accum_counter = 0, fetch_n_op_counter = 0, comp_counter = 0;
@@ -151,7 +152,7 @@ void write_to_file(int rank) {
 void calculate_timer(double *input_timer, int count, double **output_timer, double *min, double *max, double *median,
                         double *mean) {
     int i;
-    double total_time;
+    double total_time = 0.0;
     for (i = 0; i < count; i++) {
         (*output_timer)[i] =  input_timer[i] * 1.0e+6;
         total_time += (*output_timer)[i];
@@ -448,7 +449,7 @@ void check_errors(int rank, int nprocs, int tile_num, int tile_dim, int *tile_ma
 
         for (i = 0; i < mat_dim; i++) {
             for (j = 0; j < mat_dim; j++) {
-                if (mat_correct_c[i*mat_dim + j] != mat_c[i*mat_dim + j])
+                if (mat_correct_c[i*mat_dim + j] != mat_c[i*mat_dim + j]) {
                     errors++;
                     fprintf(stderr, "Idx: %ld, Exp: %lf Act: %lf\n", (i*mat_dim + j), mat_correct_c[i*mat_dim + j],
                             mat_c[i*mat_dim + j]);
@@ -470,23 +471,29 @@ void check_errors(int rank, int nprocs, int tile_num, int tile_dim, int *tile_ma
 
 }
 
-#if COMPUTE
-void dgemm(double *local_a, double *local_b, double *local_c, int tile_dim)
-{
-    int i, j, k;
+/* Done */
+int bspmm_counter_fetch(int count, MPI_Win win_counter, int *next_work_id) {
+    MPI_Fetch_and_op(&count, next_work_id, MPI_INT, 0, 0, MPI_SUM, win_counter);
+    return 0;
+}
 
-    for (j = 0; j < tile_dim; j++) {
-        for (i = 0; i < tile_dim; i++) {
-            for (k = 0; k < tile_dim; k++)
-                local_c[j + i * tile_dim] += local_a[k + i * tile_dim] * local_b[j + k * tile_dim];
+int bspmm_counter_flush(MPI_Win win_counter) {
+    MPI_Win_flush(0, win_counter);
+    return 0;
+}
+
+int invoke_local_get(double *dest, double *source, size_t tile_dim) {
+    int i, j;
+    for (i = 0; i < tile_dim; i++) {
+        for (j = 0; j < tile_dim; j++) {
+            dest[i * tile_dim + j] = source[i * tile_dim + j];
         }
     }
+    return 0;
 }
-#endif
 
 int invoke_get(int nprocs, int rank, size_t tile_dim, int *work_unit_table, int work_id, int work_unit_disp,
                 double *sub_mat, double *local_buf, MPI_Aint disp, MPI_Win win, int is_warmup, int *target_rank){
-    int i, j;
     int is_mpi_get = 0;
     double *target_tile = NULL;
     int elements_in_tile = tile_dim * tile_dim;
@@ -495,21 +502,13 @@ int invoke_get(int nprocs, int rank, size_t tile_dim, int *work_unit_table, int 
     MPI_Aint target_offset = offset_of_tile(global_tile, nprocs, tile_dim);
 
     if ((*target_rank) == rank) {
-        t_start = START_FINE_TIME(is_warmup);
         target_tile = &sub_mat[(int) target_offset];
-        for (i = 0; i < tile_dim; i++) {
-            for (j = 0; j < tile_dim; j++) {
-                local_buf[i * tile_dim + j] = target_tile[i * tile_dim + j];
-            }
-        }
-        t_local_get += GET_FINE_TIME(t_start, is_warmup);
-        local_get_counter = INCREMENT_COUNTER(local_get_counter, is_warmup);
+        PROFILE_BSPMM_FUNC(invoke_local_get(local_buf, target_tile, tile_dim),
+                           is_warmup, t_local_get, local_get_counter, 1);
     } else {
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Get(local_buf, elements_in_tile, MPI_DOUBLE, (*target_rank), disp + target_offset, elements_in_tile,
-                    MPI_DOUBLE, win);
-        t_get += GET_FINE_TIME(t_start, is_warmup);
-        get_counter = INCREMENT_COUNTER(get_counter, is_warmup);
+        PROFILE_BSPMM_FUNC(MPI_Get(local_buf, elements_in_tile, MPI_DOUBLE, (*target_rank),
+                           disp + target_offset, elements_in_tile, MPI_DOUBLE, win),
+                           is_warmup, t_get, get_counter, 1);
         is_mpi_get = 1;
     }
     return is_mpi_get;
@@ -519,29 +518,33 @@ int bspmm_get(int nprocs, int rank, size_t tile_dim, int *work_unit_table, int w
                 double *sub_mat_b, double *local_a, double *local_b, MPI_Aint disp_a, MPI_Aint disp_b,
                 MPI_Win win, int is_warmup, int *target_rank_a, int *target_rank_b) {
     int is_mpi_get_a = 0, is_mpi_get_b = 0, ret = 0;
+
 #if DUMP_GET_TIMESTAMP
     START_TIME[timestamp_counter] = MPI_Wtime();
 #endif
+
     is_mpi_get_a = invoke_get(nprocs, rank, tile_dim, work_unit_table, work_id, 0, sub_mat_a, local_a, disp_a, win,
                                 is_warmup, target_rank_a);
     is_mpi_get_b = invoke_get(nprocs, rank, tile_dim, work_unit_table, work_id, 1, sub_mat_b, local_b, disp_b, win,
                                 is_warmup, target_rank_b);
-    if (is_mpi_get_a) {
+
+    if (is_mpi_get_a && (!is_mpi_get_b)) {
         ret = 1;
-    } else if (is_mpi_get_b) {
+    } else if ((!is_mpi_get_a) && is_mpi_get_b) {
         ret = 2;
     } else if (is_mpi_get_a && is_mpi_get_b) {
         ret = 3;
     }
+
 #if DUMP_GET_TIMESTAMP
     END_TIME[timestamp_counter] = MPI_Wtime();
     timestamp_counter ++;
 #endif
+
     return ret;
 }
 
-void bspmm_get_flush(int is_mpi_get, int target_rank_a, int target_rank_b, MPI_Win win, int is_warmup) {
-    t_start = START_FINE_TIME(is_warmup);
+int bspmm_get_flush(int is_mpi_get, int target_rank_a, int target_rank_b, MPI_Win win) {
     switch (is_mpi_get) {
         case 1:
             MPI_Win_flush(target_rank_a, win);
@@ -556,56 +559,165 @@ void bspmm_get_flush(int is_mpi_get, int target_rank_a, int target_rank_b, MPI_W
         default:
             break;
     }
-    t_get_flush += GET_FINE_TIME(t_start, is_warmup);
+    return 0;
 }
 
-void bspmm_perform_local_flush(int *accum_tracker, MPI_Win win) {
+int dgemm(double *local_a, double *local_b, double *local_c, int tile_dim)
+{
+    int i, j, k;
+
+    for (j = 0; j < tile_dim; j++) {
+        for (i = 0; i < tile_dim; i++) {
+            for (k = 0; k < tile_dim; k++)
+                local_c[j + i * tile_dim] += local_a[k + i * tile_dim] * local_b[j + k * tile_dim];
+        }
+    }
+    return 0;
+}
+
+int bspmm_compute(double *local_a, double *local_b, double *local_c, size_t tile_dim) {
+#if COMPUTE
+#if USE_CBLAS
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,tile_dim,tile_dim,tile_dim,1,local_a,tile_dim,
+                    local_b,tile_dim,1,local_c,tile_dim);
+#else
+        /* compute Cij += Aik * Bkj */
+        dgemm(local_a, local_b, local_c, tile_dim);
+#endif
+#endif
+    return 0;
+}
+
+int bspmm_accumulate(int nprocs, size_t tile_dim, int *work_unit_table, int work_id, double *local_c, MPI_Aint disp_c,
+                MPI_Win win_c, int *target_rank_c, MPI_Request *req) {
+    int global_tile;
+    int elements_in_tile = tile_dim * tile_dim;
+    MPI_Aint target_offset_c;
+
+#if ACCUMULATE
+    global_tile = work_unit_table[work_id * 3 + 2];
+    (*target_rank_c) = target_rank_of_tile(global_tile, nprocs);
+    target_offset_c = offset_of_tile(global_tile, nprocs, tile_dim);
+
+#if USE_ACCUMULATE
+    MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, (*target_rank_c), disp_c + target_offset_c,
+                   elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c);
+#endif
+#if USE_RACCUMULATE
+    MPI_Raccumulate(local_c, elements_in_tile, MPI_DOUBLE, (*target_rank_c), disp_c + target_offset_c,
+                    elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c, req);
+#endif
+#endif
+    return 0;
+}
+
+int bspmm_perform_local_flush(int *accum_tracker, MPI_Win win) {
     int p;
+    int rc;
     // for (p = 0; p < nprocs; p++) {
     //     if (accum_tracker[p] > 0) {
     //         MPI_Win_flush_local(p, win);
     //     }
     // }
-    MPI_Win_flush_local_all(win);
+    rc = MPI_Win_flush_local_all(win);
+    assert(MPI_SUCCESS == rc);
     /* Reset accum tracker */
     for(p = 0; p < nprocs; p++) {
         accum_tracker[p] = 0;
     }
+    return rc;
 }
 
-void non_blocking_bspmm_v2(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
-            double * sub_mat_a, double *sub_mat_b, double *sub_mat_c, double *local_a, double *local_b, double *local_c,
-            MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c, MPI_Win win, MPI_Win win_c,
-            MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world, int is_warmup) {
-    
-    int local_c_counter = 0;
-    int local_c_idx = 0;
-    double *base_local_a = local_a;
-    double *base_local_b = local_b;
-    double *base_local_c = local_c;
-    double *next_local_a = NULL;
-    double *next_local_b = NULL;
-    int p, prev_tile_c,
-        next_work_id, next_next_work_id, cur_buf_idx, next_buf_idx,
+int bspmm_check_and_complete_req(MPI_Request *request_arr, int idx){
+    int rc;
+    MPI_Request request;
+
+    request = request_arr[idx];
+    rc = MPI_Wait(&request, MPI_STATUS_IGNORE);
+    assert(MPI_SUCCESS == rc);
+    return rc;
+}
+
+int bspmm_local_sync(int *accum_tracker, MPI_Win win_c, int local_c_idx,
+                     int local_c_counter, MPI_Request *request_arr) {
+#if ACCUMULATE
+#if USE_ACCUMULATE
+    if ((0 == (local_c_counter % LOCAL_C_COUNT)) && (local_c_counter >= LOCAL_C_COUNT)) {
+        bspmm_perform_local_flush(accum_tracker, win_c);
+    }
+#endif
+#if USE_RACCUMULATE
+    if((local_c_counter >= LOCAL_C_COUNT)) {
+        bspmm_check_and_complete_req(request_arr, local_c_idx);
+    }
+#endif
+#endif
+    return 0;
+}
+
+int bspmm_global_sync_epoch_start(MPI_Win win_c) {
+#if ACCUMULATE
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_c);
+#endif
+    return 0;
+}
+
+/* usage: if we use active sync - currently not used */
+int bspmm_check_and_complete_all_req(MPI_Request *request_arr, int count){
+    int rc;
+
+    rc = MPI_Waitall(count, request_arr, MPI_STATUS_IGNORE);
+    assert(MPI_SUCCESS == rc);
+    return rc;
+}
+
+int bspmm_global_sync_epoch_end(MPI_Win win_c) {
+#if ACCUMULATE
+#if BSPMM_BLOCKING
+    MPI_Win_sync(win_c);
+    MPI_Win_unlock_all(win_c);
+#else
+    MPI_Win_flush_all(win_c);
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Win_unlock_all(win_c);
+#endif
+#endif
+    return 0;
+}
+
+void bspmm_prefetch_nb(size_t elements_in_tile, size_t tile_size, int *work_unit_table,
+            int work_units, size_t sub_mat_elements, double * sub_mat_a, double *sub_mat_b, double *sub_mat_c,
+            double *local_a, double *local_b, double *local_c, MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c,
+            MPI_Win win, MPI_Win win_c, MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world, int is_warmup) {
+    double *base_local_a = local_a, *base_local_b = local_b, *base_local_c = local_c,
+           *next_local_a = NULL, *next_local_b = NULL;
+    int p, next_work_id, next_next_work_id, cur_buf_idx, next_buf_idx, local_c_counter, local_c_idx,
         cur_op, is_mpi_get, target_rank_a = -1, target_rank_b = -1, target_rank_c = -1;
     const int one = 1;
     const int two = 2;
-    int accum_tracker[nprocs];
+    /* Required for local_completion of accumulate */
+    MPI_Request accum_req;
+    MPI_Request accum_request_arr[LOCAL_C_COUNT];
+    int accum_tracker[nprocs]; // Track which proc receive accum request from this rank
 
     for(p = 0; p < nprocs; p++) {
         accum_tracker[p] = 0;
     }
     
     MPI_Barrier(MPI_COMM_WORLD);
+
     if(!is_warmup) {
 #if SHOW_WORKLOAD_DIST
         my_work_counter = 0;
 #endif
-        t1 = MPI_Wtime();
+        if (rank == 0) {
+            t1 = MPI_Wtime();
+        }
     }
+
     /*************** Initialization steps ***************/
-    /* Reset it for next call */
-    memset(local_c, 0, tile_size);
+    /* Reset Local C buffer */
+    memset(local_c, 0, (tile_size * LOCAL_C_COUNT));
     
     /* initialize sub matrices */
     MPI_Win_lock(MPI_LOCK_EXCLUSIVE, rank, MPI_MODE_NOCHECK, win);
@@ -626,162 +738,239 @@ void non_blocking_bspmm_v2(size_t elements_in_tile, size_t tile_size, int *work_
     MPI_Barrier(MPI_COMM_WORLD);
 
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
-    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_c); // Do we need to lock win_c ??
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win_counter);
+    bspmm_global_sync_epoch_start(win_c);
     
     MPI_Barrier(comm_world);
     MPI_Barrier(comm_world_counter);
-    prev_tile_c = -1;
 
-    t_start = START_FINE_TIME(is_warmup);
-    MPI_Fetch_and_op(&two, &next_work_id, MPI_INT, 0, 0, MPI_SUM, win_counter);
-    t_fetch_n_op += GET_FINE_TIME(t_start, is_warmup);
-    fetch_n_op_counter = INCREMENT_COUNTER(fetch_n_op_counter, is_warmup);
-
-    t_start = START_FINE_TIME(is_warmup);
-    MPI_Win_flush(0, win_counter);
-    t_fetch_n_op_flush += GET_FINE_TIME(t_start, is_warmup);
-
+    /* update the counter by 2 */
+    PROFILE_BSPMM_FUNC(bspmm_counter_fetch(two, win_counter, &next_work_id),
+                       is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
+    PROFILE_BSPMM_FUNC(bspmm_counter_flush(win_counter),
+                       is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
     next_next_work_id = next_work_id + 1;
-    fflush(stdout);
 
     /* bspmm should invoke both get A and get B - return 1 if one of the get is invoked */
-    is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, next_work_id, sub_mat_a, sub_mat_b, local_a, local_b, disp_a,
-                disp_b, win, is_warmup, &target_rank_a, &target_rank_b);
+    is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, next_work_id, sub_mat_a, sub_mat_b,
+                 local_a, local_b, disp_a, disp_b, win, is_warmup, &target_rank_a, &target_rank_b);
+
     cur_buf_idx = 0;
+    local_c_counter = 0;
+    local_c_idx = 0;
+
+    // Loop starts here
     while(next_work_id < work_units) {
 #if SHOW_WORKLOAD_DIST
         if (!is_warmup) {
             my_work_counter++;
         }
 #endif
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Win_flush(0, win_counter);
-        t_fetch_n_op_flush += GET_FINE_TIME(t_start, is_warmup);
-        bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win, is_warmup);
+
+        /* Flush the fetch-n-op and get from prev iteration */
+        PROFILE_BSPMM_FUNC(bspmm_counter_flush(win_counter),
+                           is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
+        PROFILE_BSPMM_FUNC(bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win),
+                           is_warmup, t_get_flush, get_counter, 0);
 
         cur_op = next_work_id;
         next_work_id = next_next_work_id;
-        /* Call accumulate here with */
-#if ACCUMULATE
-        int global_tile_c = work_unit_table[cur_op * 3 + 2];
-        if (global_tile_c != prev_tile_c && prev_tile_c >= 0) {
-            target_rank_c = target_rank_of_tile(prev_tile_c, nprocs);
-            MPI_Aint target_offset_c = offset_of_tile(prev_tile_c, nprocs, tile_dim);
-            
-#if DEBUG
-            if(!is_warmup) {
-                double tile_sum = 0;
-                int tile_i, tile_j;
-                for (tile_i = 0; tile_i < tile_dim; tile_i++) {
-                    for (tile_j = 0; tile_j < tile_dim; tile_j++) {
-                        tile_sum += local_c[tile_i*tile_dim + tile_j];
-                    }
-                }
-                printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
-            }
-#endif
-            t_start = START_FINE_TIME(is_warmup);
-            MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c,
-                            elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c);
-            t_accum += GET_FINE_TIME(t_start, is_warmup);
-            accum_counter = INCREMENT_COUNTER(accum_counter, is_warmup);
-            accum_tracker[target_rank_c] += 1;
-            
-            t_start = START_FINE_TIME(is_warmup);
-            if (local_c_counter % LOCAL_C_COUNT == (LOCAL_C_COUNT - 1)) {
-                bspmm_perform_local_flush(accum_tracker, win_c);
-            }
-            t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
-            
-            local_c_counter ++;
-            local_c_idx = local_c_counter % LOCAL_C_COUNT;
-            local_c = base_local_c + (local_c_idx * (elements_in_tile));
-
-            /* Reset the local C tile for local accumulation */
-            memset(local_c, 0, tile_size);
-        }
-        prev_tile_c = global_tile_c;
-#endif
 
         local_a = base_local_a + (cur_buf_idx * (elements_in_tile));
         local_b = base_local_b + (cur_buf_idx * (elements_in_tile));
-        next_buf_idx = (cur_buf_idx + 1) % 2;
-        next_local_a = base_local_a + (next_buf_idx * (elements_in_tile));
-        next_local_b = base_local_b + (next_buf_idx * (elements_in_tile));
 
         /* next work_id updated in last step. Don't invoke get and fetch_n_op in advance if not required*/
         if (next_work_id < work_units) {
+            /* Update the next_buf_id and set the buffer */
+            next_buf_idx = (cur_buf_idx + 1) % 2;
+            next_local_a = base_local_a + (next_buf_idx * (elements_in_tile));
+            next_local_b = base_local_b + (next_buf_idx * (elements_in_tile));
+
             is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, next_work_id, sub_mat_a, sub_mat_b,
-                                    next_local_a, next_local_b, disp_a, disp_b, win, is_warmup, &target_rank_a, &target_rank_b);
-
-            t_start = START_FINE_TIME(t_start);
-            MPI_Fetch_and_op(&one, &next_next_work_id, MPI_INT, 0, 0, MPI_SUM, win_counter);
-            t_fetch_n_op += GET_FINE_TIME(t_start, is_warmup);
-            fetch_n_op_counter = INCREMENT_COUNTER(fetch_n_op_counter, is_warmup);
+                                    next_local_a, next_local_b, disp_a, disp_b, win, is_warmup, &target_rank_a,
+                                    &target_rank_b);
+            PROFILE_BSPMM_FUNC(bspmm_counter_fetch(one, win_counter, &next_next_work_id),
+                               is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
+            
+            /* update the cur_buf_idx */
+            cur_buf_idx = next_buf_idx;
         }
 
-#if COMPUTE
-        t_start = START_FINE_TIME(t_start);
-#if USE_CBLAS
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,tile_dim,tile_dim,tile_dim,1,local_a,tile_dim,
-                    local_b,tile_dim,1,local_c,tile_dim);
-#else
-        /* compute Cij += Aik * Bkj */
-        dgemm(local_a, local_b, local_c, tile_dim);
-#endif
-        t_comp += GET_FINE_TIME(t_start, is_warmup);
-        comp_counter = INCREMENT_COUNTER(comp_counter, is_warmup);
-#endif
-        cur_buf_idx += next_buf_idx;
+        /* Every time give a fresh buffer for compute */
+        PROFILE_BSPMM_FUNC(bspmm_local_sync(accum_tracker, win_c, local_c_idx, local_c_counter, accum_request_arr),
+                           is_warmup, t_accum_flush, accum_counter, 0);
+        
+            local_c = base_local_c + (local_c_idx * (elements_in_tile));
+            local_c = base_local_c + (local_c_idx * (elements_in_tile));
+
+        local_c = base_local_c + (local_c_idx * (elements_in_tile));
+
+        /* Reset the local C tile for local accumulation */
+        memset(local_c, 0, tile_size);
+
+        /* Do compute */
+        PROFILE_BSPMM_FUNC(bspmm_compute(local_a, local_b, local_c, tile_dim),
+                           is_warmup, t_comp, comp_counter, 1);
+        /* Do accumulate with the computed C buffer */
+        PROFILE_BSPMM_FUNC(bspmm_accumulate(nprocs, tile_dim, work_unit_table, cur_op, local_c, disp_c,
+                                            win_c, &target_rank_c, &accum_req),
+                           is_warmup, t_accum, accum_counter, 1);
+
+        accum_tracker[target_rank_c] += 1;
+        accum_request_arr[local_c_idx] = accum_req;
+        local_c_counter ++;
+        local_c_idx = local_c_counter % LOCAL_C_COUNT;
     }
 
-#if ACCUMULATE
-    if (prev_tile_c >= 0) {
-        /* MPI_Accumulate locally accumulated C before finishing */
-        int target_rank_c = target_rank_of_tile(prev_tile_c, nprocs);
-        MPI_Aint target_offset_c = offset_of_tile(prev_tile_c, nprocs, tile_dim);
-#if DEBUG
-        if(!is_warmup) {
-            double tile_sum = 0;
-            int tile_i, tile_j;
-            for (tile_i = 0; tile_i < tile_dim; tile_i++) {
-                for (tile_j = 0; tile_j < tile_dim; tile_j++) {
-                    tile_sum += local_c[tile_i*tile_dim + tile_j];
-                }
-            }
-            printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
-        }
-#endif
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c, elements_in_tile,
-                       MPI_DOUBLE, MPI_SUM, win_c);
-        t_accum += GET_FINE_TIME(t_start, is_warmup);
-        accum_counter = INCREMENT_COUNTER(accum_counter, is_warmup);
-
-        t_start = START_FINE_TIME(is_warmup);
-        bspmm_perform_local_flush(accum_tracker, win_c);
-        t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
-    }
-
-    t_start = START_FINE_TIME(is_warmup);
-    MPI_Win_flush_all(win_c);
-    t_global_accum_flush = GET_FINE_TIME(t_start, is_warmup);
-#endif
+    PROFILE_BSPMM_FUNC(bspmm_global_sync_epoch_end(win_c),
+                       is_warmup, t_global_accum_flush, accum_counter, 0);
 
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Win_sync(win);    /* MEM_MODE: synchronize private and public window copies */
-    MPI_Win_sync(win_c);    /* MEM_MODE: synchronize private and public window copies */
+    MPI_Win_sync(win_counter);
 
     MPI_Win_unlock_all(win);
-    MPI_Win_unlock_all(win_c);
     MPI_Win_unlock_all(win_counter);
-    if(!is_warmup) {
-        t2 = MPI_Wtime();
+
+    /* Reset local c*/
+    local_c = base_local_c;
+
+    if (!is_warmup) {
+        if(rank == 0) {
+            t2 = MPI_Wtime();
+        }
     }
 }
 
-void non_blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
+void bspmm_nb(size_t elements_in_tile, size_t tile_size, int *work_unit_table,
+            int work_units, size_t sub_mat_elements, double * sub_mat_a, double *sub_mat_b, double *sub_mat_c,
+            double *local_a, double *local_b, double *local_c, MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c,
+            MPI_Win win, MPI_Win win_c, MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world, int is_warmup) {
+    double *base_local_c = local_c;
+    int p, next_work_id, local_c_counter, local_c_idx,
+        is_mpi_get, target_rank_a = -1, target_rank_b = -1, target_rank_c = -1;
+    const int one = 1;
+    /* Required for local_completion of accumulate */
+    MPI_Request accum_req;
+    MPI_Request accum_request_arr[LOCAL_C_COUNT];
+    int accum_tracker[nprocs]; // Track which proc receive accum request from this rank
+
+    for(p = 0; p < nprocs; p++) {
+        accum_tracker[p] = 0;
+    }
+    
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if(!is_warmup) {
+#if SHOW_WORKLOAD_DIST
+        my_work_counter = 0;
+#endif
+        if (rank == 0) {
+            t1 = MPI_Wtime();
+        }
+    }
+
+    /*************** Initialization steps ***************/
+    /* Reset Local C buffer */
+    memset(local_c, 0, (tile_size * LOCAL_C_COUNT));
+    
+    /* initialize sub matrices */
+    MPI_Win_lock(MPI_LOCK_EXCLUSIVE, rank, MPI_MODE_NOCHECK, win);
+    MPI_Win_lock(MPI_LOCK_EXCLUSIVE, rank, MPI_MODE_NOCHECK, win_c);
+    init_sub_mats(sub_mat_a, sub_mat_b, sub_mat_c, sub_mat_elements);
+    MPI_Win_unlock(rank, win);
+    MPI_Win_unlock(rank, win_c);
+
+    if (rank == 0) {
+        /* initialize global counter */
+        MPI_Win_lock(MPI_LOCK_EXCLUSIVE, 0, MPI_MODE_NOCHECK, win_counter);
+        *counter_win_mem = 0;
+        MPI_Win_unlock(0, win_counter); /* MEM_MODE: update to my private window becomes
+                                         * visible in public window */
+    }
+
+    /*************** BSPMM steps ***************/
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_counter);
+    bspmm_global_sync_epoch_start(win_c);
+    
+    MPI_Barrier(comm_world);
+    MPI_Barrier(comm_world_counter);
+
+    /* update the counter by 2 */
+    PROFILE_BSPMM_FUNC(bspmm_counter_fetch(one, win_counter, &next_work_id),
+                       is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
+    PROFILE_BSPMM_FUNC(bspmm_counter_flush(win_counter),
+                       is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
+
+    local_c_counter = 0;
+    local_c_idx = 0;
+
+    // Loop starts here
+    while(next_work_id < work_units) {
+#if SHOW_WORKLOAD_DIST
+        if (!is_warmup) {
+            my_work_counter++;
+        }
+#endif
+        is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, next_work_id, sub_mat_a, sub_mat_b,
+                                    local_a, local_b, disp_a, disp_b, win, is_warmup, &target_rank_a,
+                                    &target_rank_b);
+        PROFILE_BSPMM_FUNC(bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win),
+                           is_warmup, t_get_flush, get_counter, 0);
+
+
+        /* Every time give a fresh buffer for compute */
+        PROFILE_BSPMM_FUNC(bspmm_local_sync(accum_tracker, win_c, local_c_idx, local_c_counter, accum_request_arr),
+                           is_warmup, t_accum_flush, accum_counter, 0);
+        
+        /* Reset the local C tile for local accumulation */
+        local_c = base_local_c + (local_c_idx * (elements_in_tile));
+        memset(local_c, 0, tile_size);
+
+        /* Do compute */
+        PROFILE_BSPMM_FUNC(bspmm_compute(local_a, local_b, local_c, tile_dim),
+                           is_warmup, t_comp, comp_counter, 1);
+
+        /* Do accumulate with the computed C buffer */
+        PROFILE_BSPMM_FUNC(bspmm_accumulate(nprocs, tile_dim, work_unit_table, next_work_id, local_c, disp_c,
+                                            win_c, &target_rank_c, &accum_req),
+                           is_warmup, t_accum, accum_counter, 1);
+
+        accum_tracker[target_rank_c] += 1;
+        accum_request_arr[local_c_idx] = accum_req;
+        local_c_counter ++;
+        local_c_idx = local_c_counter % LOCAL_C_COUNT;
+
+        PROFILE_BSPMM_FUNC(bspmm_counter_fetch(one, win_counter, &next_work_id),
+                           is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
+        PROFILE_BSPMM_FUNC(bspmm_counter_flush(win_counter),
+                           is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
+    }
+
+    PROFILE_BSPMM_FUNC(bspmm_global_sync_epoch_end(win_c),
+                       is_warmup, t_global_accum_flush, accum_counter, 0);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Win_sync(win);    /* MEM_MODE: synchronize private and public window copies */
+    MPI_Win_sync(win_counter);
+
+    MPI_Win_unlock_all(win);
+    MPI_Win_unlock_all(win_counter);
+
+    /* Reset local c*/
+    local_c = base_local_c;
+
+    if (!is_warmup) {
+        if(rank == 0) {
+            t2 = MPI_Wtime();
+        }
+    }
+}
+
+void bspmm_nb_v1(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
             double * sub_mat_a, double *sub_mat_b, double *sub_mat_c, double *local_a, double *local_b, double *local_c,
             MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c, MPI_Win win, MPI_Win win_c,
             MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world, int is_warmup) {
@@ -836,23 +1025,21 @@ void non_blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_uni
     /*************** BSPMM steps ***************/
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
-    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_c); // Do we need to lock win_c ??
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win_counter);
     MPI_Barrier(comm_world);
     MPI_Barrier(comm_world_counter);
 
+    bspmm_global_sync_epoch_start(win_c);
+
     prev_tile_c = -1; 
 
     do {
-        t_start = START_FINE_TIME(is_warmup);
         /* read and increment global counter atomically */
-        MPI_Fetch_and_op(&one, &work_id, MPI_INT, 0, 0, MPI_SUM, win_counter);
-        t_fetch_n_op += GET_FINE_TIME(t_start, is_warmup);
-        fetch_n_op_counter = INCREMENT_COUNTER(fetch_n_op_counter, is_warmup);
+        PROFILE_BSPMM_FUNC(MPI_Fetch_and_op(&one, &work_id, MPI_INT, 0, 0, MPI_SUM, win_counter),
+                           is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
 
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Win_flush(0, win_counter);
-        t_fetch_n_op_flush += GET_FINE_TIME(t_start, is_warmup);
+        PROFILE_BSPMM_FUNC(MPI_Win_flush(0, win_counter),
+                           is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
 
         if (work_id >= work_units)
             break;
@@ -882,19 +1069,15 @@ void non_blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_uni
                 printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
             }
 #endif
-            t_start = START_FINE_TIME(is_warmup);
-            MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c,
-                            elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c);
-            t_accum += GET_FINE_TIME(t_start, is_warmup);
-            accum_counter  = INCREMENT_COUNTER(accum_counter, is_warmup);
-
+            PROFILE_BSPMM_FUNC(MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c,
+                                              disp_c + target_offset_c, elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c),
+                               is_warmup, t_accum, accum_counter, 1);
             accum_tracker[target_rank_c] += 1;
 
-            t_start = START_FINE_TIME(is_warmup);
             if (local_c_counter % LOCAL_C_COUNT == (LOCAL_C_COUNT - 1)) {
-                bspmm_perform_local_flush(accum_tracker, win_c);
+                PROFILE_BSPMM_FUNC(bspmm_perform_local_flush(accum_tracker, win_c),
+                                   is_warmup, t_accum_flush, accum_counter, 0);
             }
-            t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
 
             local_c_counter ++;
             local_c_idx = local_c_counter % LOCAL_C_COUNT;
@@ -910,20 +1093,11 @@ void non_blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_uni
         is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, work_id, sub_mat_a, sub_mat_b, local_a, local_b, disp_a,
                 disp_b, win, is_warmup, &target_rank_a, &target_rank_b);
         
-        bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win, is_warmup);
+        PROFILE_BSPMM_FUNC(bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win),
+                           is_warmup, t_get_flush, get_counter, 0);
 
-#if COMPUTE
-        t_start = START_FINE_TIME(is_warmup);
-#if USE_CBLAS
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,tile_dim,tile_dim,tile_dim,1,local_a,tile_dim,
-                    local_b,tile_dim,1,local_c,tile_dim);
-#else
-        /* compute Cij += Aik * Bkj */
-        dgemm(local_a, local_b, local_c, tile_dim);
-#endif
-        t_comp += GET_FINE_TIME(t_start, is_warmup);
-        comp_counter  = INCREMENT_COUNTER(comp_counter, is_warmup);
-#endif
+        PROFILE_BSPMM_FUNC(bspmm_compute(local_a, local_b, local_c, tile_dim),
+                           is_warmup, t_comp, comp_counter, 1);
     } while (work_id < work_units);
 
 #if ACCUMULATE
@@ -944,45 +1118,42 @@ void non_blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_uni
             printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
         }
 #endif
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c, elements_in_tile,
-                   MPI_DOUBLE, MPI_SUM, win_c);
+        PROFILE_BSPMM_FUNC(MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c,
+                                          disp_c + target_offset_c, elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c),
+                           is_warmup, t_accum, accum_counter, 1);
         accum_tracker[target_rank_c] += 1;
-        t_accum += GET_FINE_TIME(t_start, is_warmup);
-        accum_counter = INCREMENT_COUNTER(accum_counter, is_warmup);
 
-        START_FINE_TIME(is_warmup);
-        bspmm_perform_local_flush(accum_tracker, win_c);
-        t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
+        PROFILE_BSPMM_FUNC(bspmm_perform_local_flush(accum_tracker, win_c),
+                           is_warmup, t_accum_flush, accum_counter, 0);
+
+        local_c_counter ++;
+        local_c_idx = local_c_counter % LOCAL_C_COUNT;
+        local_c = base_local_c + (local_c_idx * (elements_in_tile));
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    /* A final global flush to all ranks here */
-    t_start = START_FINE_TIME(is_warmup);
-    MPI_Win_flush_all(win_c);
-    t_global_accum_flush += GET_FINE_TIME(t_start, is_warmup);
+    PROFILE_BSPMM_FUNC(bspmm_global_sync_epoch_end(win_c),
+                       is_warmup, t_global_accum_flush, accum_counter, 0);
 #endif
 
     MPI_Barrier(MPI_COMM_WORLD);
 
     MPI_Win_sync(win);    /* MEM_MODE: synchronize private and public window copies */
-    MPI_Win_sync(win_c);    /* MEM_MODE: synchronize private and public window copies */
+    MPI_Win_sync(win_counter);
 
     MPI_Win_unlock_all(win);
-    MPI_Win_unlock_all(win_c);
     MPI_Win_unlock_all(win_counter);
 
     /* Reset local c*/
     local_c = base_local_c;
-    if (rank == 0) {
-        if (!is_warmup) {
+    if (!is_warmup) {
+        if (rank == 0) {
             t2 = MPI_Wtime();
         }
     }
 }
 
 
-void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
+void bspmm_b(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
             double * sub_mat_a, double *sub_mat_b, double *sub_mat_c, double *local_a, double *local_b, double *local_c,
             MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c, MPI_Win win, MPI_Win win_c,
             MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world, int is_warmup) {
@@ -1031,23 +1202,21 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
     /*************** BSPMM steps ***************/
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
-    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_c); // Do we need to lock win_c ??
     MPI_Win_lock_all(MPI_MODE_NOCHECK, win_counter);
+
+    bspmm_global_sync_epoch_start(win_c);
+
     MPI_Barrier(comm_world);
     MPI_Barrier(comm_world_counter);
 
     prev_tile_c = -1; 
 
     do {
-        t_start = START_FINE_TIME(is_warmup);
         /* read and increment global counter atomically */
-        MPI_Fetch_and_op(&one, &work_id, MPI_INT, 0, 0, MPI_SUM, win_counter);
-        t_fetch_n_op += GET_FINE_TIME(t_start, is_warmup);
-        fetch_n_op_counter = INCREMENT_COUNTER(fetch_n_op_counter, is_warmup);
-
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Win_flush(0, win_counter);
-        t_fetch_n_op_flush += GET_FINE_TIME(t_start, is_warmup);
+        PROFILE_BSPMM_FUNC(MPI_Fetch_and_op(&one, &work_id, MPI_INT, 0, 0, MPI_SUM, win_counter),
+                           is_warmup, t_fetch_n_op, fetch_n_op_counter, 1);
+        PROFILE_BSPMM_FUNC(MPI_Win_flush(0, win_counter),
+                           is_warmup, t_fetch_n_op_flush, fetch_n_op_counter, 0);
 
         if (work_id >= work_units)
             break;
@@ -1077,15 +1246,11 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
                 printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
             }
 #endif
-            t_start = START_FINE_TIME(is_warmup);
-            MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c,
-                            elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c);
-            t_accum += GET_FINE_TIME(t_start, is_warmup);
-            accum_counter  = INCREMENT_COUNTER(accum_counter, is_warmup);
-
-            t_start = START_FINE_TIME(is_warmup);
-            MPI_Win_flush(target_rank_c, win_c);
-            t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
+            PROFILE_BSPMM_FUNC(MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c,
+                                              disp_c + target_offset_c, elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c),
+                               is_warmup, t_accum, accum_counter, 1);
+            PROFILE_BSPMM_FUNC(MPI_Win_flush(target_rank_c, win_c),
+                               is_warmup, t_accum_flush, accum_counter, 0);
 
             /* Reset the local C tile for local accumulation */
             memset(local_c, 0, tile_size);
@@ -1097,20 +1262,11 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
         is_mpi_get = bspmm_get(nprocs, rank, tile_dim, work_unit_table, work_id, sub_mat_a, sub_mat_b, local_a, local_b, disp_a,
                 disp_b, win, is_warmup, &target_rank_a, &target_rank_b);
         
-        bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win, is_warmup);
+        PROFILE_BSPMM_FUNC(bspmm_get_flush(is_mpi_get, target_rank_a, target_rank_b, win),
+                           is_warmup, t_get_flush, get_counter, 0);
 
-#if COMPUTE
-        t_start = START_FINE_TIME(is_warmup);
-#if USE_CBLAS
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,tile_dim,tile_dim,tile_dim,1,local_a,tile_dim,
-                    local_b,tile_dim,1,local_c,tile_dim);
-#else
-        /* compute Cij += Aik * Bkj */
-        dgemm(local_a, local_b, local_c, tile_dim);
-#endif
-        t_comp += GET_FINE_TIME(t_start, is_warmup);
-        comp_counter  = INCREMENT_COUNTER(comp_counter, is_warmup);
-#endif
+        PROFILE_BSPMM_FUNC(bspmm_compute(local_a, local_b, local_c, tile_dim),
+                           is_warmup, t_comp, comp_counter, 1);
     } while (work_id < work_units);
 
 #if ACCUMULATE
@@ -1131,15 +1287,11 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
             printf("Rank %d accumulating tile %d with value %.1f on rank %d using offset %ld\n", rank, prev_tile_c, tile_sum, target_rank_c, target_offset_c);
         }
 #endif
-        t_start = START_FINE_TIME(is_warmup);
-        MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c, disp_c + target_offset_c, elements_in_tile,
-                   MPI_DOUBLE, MPI_SUM, win_c);
-        t_accum += GET_FINE_TIME(t_start, is_warmup);
-        accum_counter = INCREMENT_COUNTER(accum_counter, is_warmup);
-
-        START_FINE_TIME(is_warmup);
-        MPI_Win_flush(target_rank_c, win_c);
-        t_accum_flush += GET_FINE_TIME(t_start, is_warmup);
+        PROFILE_BSPMM_FUNC(MPI_Accumulate(local_c, elements_in_tile, MPI_DOUBLE, target_rank_c,
+                                          disp_c + target_offset_c, elements_in_tile, MPI_DOUBLE, MPI_SUM, win_c),
+                           is_warmup, t_accum, accum_counter, 1);
+        PROFILE_BSPMM_FUNC(MPI_Win_flush(target_rank_c, win_c),
+                           is_warmup, t_accum_flush, accum_counter, 0);
     }
 
     /* A final global flush to all ranks here */
@@ -1147,12 +1299,13 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
 #endif
 
     MPI_Barrier(MPI_COMM_WORLD);
+    PROFILE_BSPMM_FUNC(bspmm_global_sync_epoch_end(win_c),
+                       is_warmup, t_global_accum_flush, accum_counter, 0);
 
     MPI_Win_sync(win);    /* MEM_MODE: synchronize private and public window copies */
-    MPI_Win_sync(win_c);    /* MEM_MODE: synchronize private and public window copies */
+    MPI_Win_sync(win_counter);
 
     MPI_Win_unlock_all(win);
-    MPI_Win_unlock_all(win_c);
     MPI_Win_unlock_all(win_counter);
 
     if (rank == 0) {
@@ -1160,6 +1313,41 @@ void blocking_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_ta
             t2 = MPI_Wtime();
         }
     }
+}
+
+void run_bspmm(size_t elements_in_tile, size_t tile_size, int *work_unit_table, int work_units, size_t sub_mat_elements,
+            double * sub_mat_a, double *sub_mat_b, double *sub_mat_c, double *local_a, double *local_b, double *local_c,
+            MPI_Aint disp_a, MPI_Aint disp_b, MPI_Aint disp_c, MPI_Win win, MPI_Win win_c,
+            MPI_Win win_counter, int *counter_win_mem, MPI_Comm comm_world){
+#if BSPMM_BLOCKING
+#if WARMUP
+    bspmm_b(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+            sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+            win, win_c, win_counter, counter_win_mem, comm_world, 1);
+#endif
+    bspmm_b(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+            sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+            win, win_c, win_counter, counter_win_mem, comm_world, 0);
+#elif BSPMM_NON_BLOCKING
+#if WARMUP
+    bspmm_nb(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+             sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+             win, win_c, win_counter, counter_win_mem, comm_world, 1);
+#endif
+
+    bspmm_nb(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+             sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+             win, win_c, win_counter, counter_win_mem, comm_world, 0);
+#elif BSPMM_PREFETCH_NON_BLOCKING
+#if WARMUP
+    bspmm_prefetch_nb(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+                      sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+                      win, win_c, win_counter, counter_win_mem, comm_world, 1);
+#endif
+    bspmm_prefetch_nb(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+                      sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
+                      win, win_c, win_counter, counter_win_mem, comm_world, 0);
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -1182,10 +1370,10 @@ int main(int argc, char **argv) {
     int *counter_win_mem;
     MPI_Win win, win_c, win_counter;
 
-    // int in_node_p_dim;
-    // int node_i, node_j;
-    // int in_node_i, in_node_j;
-    // int rank_in_parray;
+    int in_node_p_dim;
+    int node_i, node_j;
+    int in_node_i, in_node_j;
+    int rank_in_parray;
     // char bind_inp;
     MPI_Comm comm_world;
 
@@ -1210,20 +1398,21 @@ int main(int argc, char **argv) {
     elements_in_tile = tile_dim * tile_dim;
     tile_size = elements_in_tile * sizeof(double);
 
-    // in_node_p_dim = p_dim / node_dim;
-    // /* find my rank in the processor array from my rank in COMM_WORLD */
-    // node_i = rank / (ppn * node_dim);
-    // node_j = (rank / ppn) % node_dim;
-    // in_node_i = (rank / in_node_p_dim) % in_node_p_dim;
-    // in_node_j = rank % in_node_p_dim;
-    // rank_in_parray = (node_i * ppn * node_dim) + (in_node_i * p_dim) + (node_j * in_node_p_dim) + in_node_j;
+#if ENABLE_LOGICAL_RANK
+    in_node_p_dim = p_dim / node_dim;
+    /* find my rank in the processor array from my rank in COMM_WORLD */
+    node_i = rank / (ppn * node_dim);
+    node_j = (rank / ppn) % node_dim;
+    in_node_i = (rank / in_node_p_dim) % in_node_p_dim;
+    in_node_j = rank % in_node_p_dim;
+    rank_in_parray = (node_i * ppn * node_dim) + (in_node_i * p_dim) + (node_j * in_node_p_dim) + in_node_j;
 
     /* Change rank to match the logical ranks used in this application */
-    // printf("Rank: %d rank_in_parray: %d\n", rank, rank_in_parray); fflush(stdout);
+    MPI_Comm_split(MPI_COMM_WORLD, 0, rank_in_parray, &comm_world);
+#endif
+
     MPI_Comm_split(MPI_COMM_WORLD, 0, rank, &comm_world);
     MPI_Comm_split(MPI_COMM_WORLD, 0, rank, &comm_world_counter);
-
-    // MPI_Comm_split(MPI_COMM_WORLD, 0, rank_in_parray, &comm_world);
 
 #if DEBUG
     if (rank == 0) {
@@ -1313,14 +1502,10 @@ int main(int argc, char **argv) {
     local_b = calloc(elements_in_tile * 2, sizeof(double));
     local_c = calloc(elements_in_tile * LOCAL_C_COUNT, sizeof(double));
 
-#if WARMUP
-    non_blocking_bspmm_v2(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
+    run_bspmm(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
             sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
-            win, win_c, win_counter, counter_win_mem, comm_world, 1);
-#endif
-    non_blocking_bspmm_v2(elements_in_tile, tile_size, work_unit_table, work_units, sub_mat_elements,
-            sub_mat_a, sub_mat_b, sub_mat_c, local_a, local_b, local_c, disp_a, disp_b, disp_c,
-            win, win_c, win_counter, counter_win_mem, comm_world, 0);
+            win, win_c, win_counter, counter_win_mem, comm_world);
+
 #if FINE_TIME
     calculate_fine_time(mat_dim, work_units, comm_world);
 #endif

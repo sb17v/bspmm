@@ -2,7 +2,7 @@
 USE_CBLAS=yes
 USE_DEBUG=no
 CC=mpicc
-CFLAGS=-g -O0 -Wall
+CFLAGS=-g3 -O3 -Wall
 ifeq ($(USE_DEBUG), yes)
 	CFLAGS+= -DDEBUG
 endif
